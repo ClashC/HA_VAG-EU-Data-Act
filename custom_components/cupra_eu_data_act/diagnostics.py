@@ -14,9 +14,11 @@ from .const import (
     CONF_BRAND,
     CONF_EMAIL,
     CONF_IDENTIFIER,
+    CONF_LAST_CONNECTED_OFFSET_HOURS,
     CONF_NICKNAME,
     CONF_PASSWORD,
     CONF_VIN,
+    DEFAULT_LAST_CONNECTED_OFFSET_HOURS,
     DOMAIN,
 )
 from .data import CURATED_FIELDS, detect_dataset_format, field_coverage
@@ -47,6 +49,12 @@ async def async_get_config_entry_diagnostics(
             "version": _MANIFEST.get("version"),
             "brand": entry.data.get(CONF_BRAND),
             "nickname": entry.data.get(CONF_NICKNAME),
+        },
+        "options": {
+            CONF_LAST_CONNECTED_OFFSET_HOURS: entry.options.get(
+                CONF_LAST_CONNECTED_OFFSET_HOURS,
+                DEFAULT_LAST_CONNECTED_OFFSET_HOURS,
+            ),
         },
         "status": {
             "label": coordinator.status_label,
