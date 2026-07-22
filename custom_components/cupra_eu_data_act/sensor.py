@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 from homeassistant.components.sensor import (
     SensorDeviceClass,
     SensorEntity,
@@ -675,8 +677,12 @@ class EudaLastConnectedSensor(EudaEntity, SensorEntity):
 
     @property
     def native_value(self):
-        return self._sticky_monotonic(last_connected_time(self.coordinator.data or {}))
+        timestamp = last_connected_time(self.coordinator.data or {})
 
+        if timestamp is None:
+            return self._sticky(None)
+
+        return self._sticky(timestamp + timedelta(hours=2))
 
 class EudaDatasetGeneratedSensor(EudaEntity, SensorEntity):
     """When the portal generated the currently loaded dataset ZIP."""
