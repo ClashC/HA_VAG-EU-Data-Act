@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import timedelta
 
 import aiohttp
 
@@ -16,13 +17,15 @@ from .brands import DEFAULT_BRAND, get_brand
 from .const import (
     CONF_BRAND,
     CONF_EMAIL,
+    CONF_LAST_CONNECTED_OFFSET_HOURS,
     CONF_PASSWORD,
     CONF_VIN,
+    DEFAULT_LAST_CONNECTED_OFFSET_HOURS,
     DOMAIN,
     raw_unique_id,
 )
 from .coordinator import EudaCoordinator
-from .data import load_dictionary
+from .data import last_connected_time, load_dictionary
 from .entity_migration import (
     async_migrate_entity_translations,
     async_sync_distance_registry_units,
@@ -32,6 +35,64 @@ from .services import async_setup_services, async_unload_services
 from .utility_meter import async_ensure_utility_meters
 
 PLATFORMS: list[Platform] = [Platform.SENSOR, Platform.BINARY_SENSOR, Platform.BUTTON]
+
+
+def _last_connected_offset_hours(entity) -> float:
+    """Return a validated per-config-entry offset in hours."""
+    value = entity.coordinator.entry.options.get(
+        CONF_LAST_CONNECTED_OFFSET_HOURS,
+        DEFAULT_LAST_CONNECTED_OFFSET_HOURS,
+    )
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_LAST_CONNECTED_OFFSET_HOURS
+
+
+def _last_connected_native_value(entity):
+    """Return Last connected with the optional manual offset applied."""
+    raw_timestamp = last_connected_time(entity.coordinator.data or {})
+    if raw_timestamp is None:
+        return entity._sticky_monotonic(None)
+
+    return entity._sticky_monotonic(
+        raw_timestamp + timedelta(hours=_last_connected_offset_hours(entity))
+    )
+
+
+def _last_connected_extra_state_attributes(entity) -> dict:
+    """Expose the raw timestamp and configured workaround for diagnostics."""
+    raw_timestamp = last_connected_time(entity.coordinator.data or {})
+    offset = _last_connected_offset_hours(entity)
+    return {
+        "raw_timestamp": (
+            raw_timestamp.isoformat() if raw_timestamp is not None else None
+        ),
+        "manual_offset_hours": offset,
+        "manual_offset_applied": offset != 0,
+    }
+
+
+def _patch_last_connected_sensor() -> None:
+    """Replace the fork's fixed offset with a configurable entity property."""
+    from . import sensor as sensor_platform
+
+    sensor_platform.EudaLastConnectedSensor.timestamp_offset_hours = property(
+        _last_connected_offset_hours
+    )
+    sensor_platform.EudaLastConnectedSensor.native_value = property(
+        _last_connected_native_value
+    )
+    sensor_platform.EudaLastConnectedSensor.extra_state_attributes = property(
+        _last_connected_extra_state_attributes
+    )
+
+
+@callback
+def _async_options_updated(hass: HomeAssistant, entry: "EudaConfigEntry") -> None:
+    """Refresh entity states after an option changes, without reloading."""
+    if entry.runtime_data:
+        entry.runtime_data.coordinator.async_update_listeners()
 
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
@@ -65,18 +126,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: EudaConfigEntry) -> bool
     integration is waiting for; the dataset-derived entities appear via the
     discovery listener as soon as real data arrives.
     """
-    # Own session (own cookie jar — auth is cookie-based) but reuse Home
-    # Assistant's shared connector so we benefit from its warm DNS cache and are
-    # resilient to transient DNS hiccups. connector_owner=False so closing our
-    # session never closes the shared connector.
     session = aiohttp.ClientSession(
         connector=async_get_clientsession(hass).connector,
         connector_owner=False,
         cookie_jar=aiohttp.CookieJar(),
     )
     try:
-        # Warm the data-dictionary cache off the event loop (it reads a bundled
-        # JSON file) so it doesn't block the loop during dataset parsing.
         await hass.async_add_executor_job(load_dictionary)
 
         brand = get_brand(entry.data.get(CONF_BRAND, DEFAULT_BRAND))
@@ -88,16 +143,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: EudaConfigEntry) -> bool
         )
         coordinator = EudaCoordinator(hass, entry, client)
         entry.runtime_data = EudaRuntimeData(coordinator=coordinator, session=session)
+        entry.async_on_unload(entry.add_update_listener(_async_options_updated))
 
-        # Migrate pre-0.1.3 raw sensor unique_ids (bare dataset key -> VIN_key)
-        # so they survive the namespacing fix that lets multiple vehicles work.
+        _patch_last_connected_sensor()
+
         await _async_migrate_raw_unique_ids(hass, entry)
-
-        # Before platforms register entities: rename legacy unique_ids (e.g.
-        # mileage.value.timestamp -> last_connected) so restored orphans are
-        # adopted instead of duplicated.
         await async_migrate_entity_translations(hass, entry)
-
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
         if cached_points := await coordinator.async_restore_from_cache():
@@ -113,18 +164,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: EudaConfigEntry) -> bool
         entry.async_on_unload(coordinator.async_add_listener(_on_coordinator_update))
         _on_coordinator_update()
 
-        # Kick off the first refresh after platform setup so the discovery
-        # listeners are already wired up when data arrives. Failures are not
-        # propagated to async_setup_entry — they are surfaced via the status
-        # sensor and HA's regular coordinator retry logic.
         entry.async_create_background_task(
             hass,
             coordinator.async_refresh(),
             name=f"{DOMAIN} initial refresh {entry.data[CONF_VIN]}",
         )
     except Exception:
-        # Setup failed: HA will not call async_unload_entry, so close the
-        # session here to avoid leaking it (and its connector).
         await session.close()
         raise
 
@@ -132,12 +177,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: EudaConfigEntry) -> bool
 
 
 async def _async_migrate_raw_unique_ids(hass: HomeAssistant, entry: EudaConfigEntry) -> None:
-    """Prefix legacy raw-sensor unique_ids (bare dataset key) with the VIN.
-
-    Curated sensors were always namespaced; only raw diagnostic sensors used the
-    bare key, which collides across vehicles. Renaming them in the registry
-    preserves the user's entity_ids/customisations across the fix.
-    """
+    """Prefix legacy raw-sensor unique_ids (bare dataset key -> VIN_key)."""
     vin = entry.data[CONF_VIN]
     prefix = f"{vin}_"
 
@@ -146,7 +186,7 @@ async def _async_migrate_raw_unique_ids(hass: HomeAssistant, entry: EudaConfigEn
         if reg_entry.domain != "sensor":
             return None
         if reg_entry.unique_id.startswith(prefix):
-            return None  # already namespaced (curated, or already migrated)
+            return None
         return {"new_unique_id": raw_unique_id(vin, reg_entry.unique_id)}
 
     await er.async_migrate_entries(hass, entry.entry_id, _migrate)

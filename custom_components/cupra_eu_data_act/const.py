@@ -46,6 +46,10 @@ CONF_VIN = "vin"
 CONF_IDENTIFIER = "identifier"
 CONF_NICKNAME = "nickname"
 
+# Optional workaround for vehicle-specific portal timestamp errors.
+CONF_LAST_CONNECTED_OFFSET_HOURS = "last_connected_offset_hours"
+DEFAULT_LAST_CONNECTED_OFFSET_HOURS = 0.0
+
 # --- Scheduling -----------------------------------------------------------
 DATASET_INTERVAL = timedelta(minutes=15)
 POST_DATASET_BUFFER = timedelta(seconds=45)
