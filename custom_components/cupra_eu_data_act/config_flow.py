@@ -7,8 +7,18 @@ from typing import Any
 import aiohttp
 import voluptuous as vol
 
-from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.config_entries import (
+    ConfigEntry,
+    ConfigFlow,
+    ConfigFlowResult,
+    OptionsFlow,
+)
+from homeassistant.const import UnitOfTime
+from homeassistant.core import callback
 from homeassistant.helpers.selector import (
+    NumberSelector,
+    NumberSelectorConfig,
+    NumberSelectorMode,
     SelectOptionDict,
     SelectSelector,
     SelectSelectorConfig,
@@ -20,9 +30,11 @@ from .const import (
     CONF_BRAND,
     CONF_EMAIL,
     CONF_IDENTIFIER,
+    CONF_LAST_CONNECTED_OFFSET_HOURS,
     CONF_NICKNAME,
     CONF_PASSWORD,
     CONF_VIN,
+    DEFAULT_LAST_CONNECTED_OFFSET_HOURS,
     DOMAIN,
 )
 
@@ -37,10 +49,36 @@ _BRAND_SELECTOR = SelectSelector(
 )
 
 
+def _options_schema(current_offset: float) -> vol.Schema:
+    """Return the options schema with the current offset as default."""
+    return vol.Schema(
+        {
+            vol.Required(
+                CONF_LAST_CONNECTED_OFFSET_HOURS,
+                default=current_offset,
+            ): NumberSelector(
+                NumberSelectorConfig(
+                    min=-24,
+                    max=24,
+                    step=0.25,
+                    mode=NumberSelectorMode.BOX,
+                    unit_of_measurement=UnitOfTime.HOURS,
+                )
+            )
+        }
+    )
+
+
 class EudaConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle the config flow."""
 
     VERSION = 1
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry: ConfigEntry) -> "EudaOptionsFlow":
+        """Create the integration options flow."""
+        return EudaOptionsFlow()
 
     def __init__(self) -> None:
         self._brand: str = DEFAULT_BRAND
@@ -209,3 +247,28 @@ class EudaConfigFlow(ConfigFlow, domain=DOMAIN):
                 vin,
             )
         return identifier, meta.get("Name")
+
+
+class EudaOptionsFlow(OptionsFlow):
+    """Handle integration options without reloading the integration."""
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Configure the manual Last connected timestamp offset."""
+        if user_input is not None:
+            return self.async_create_entry(title="", data=user_input)
+
+        current = self.config_entry.options.get(
+            CONF_LAST_CONNECTED_OFFSET_HOURS,
+            DEFAULT_LAST_CONNECTED_OFFSET_HOURS,
+        )
+        try:
+            current_offset = float(current)
+        except (TypeError, ValueError):
+            current_offset = DEFAULT_LAST_CONNECTED_OFFSET_HOURS
+
+        return self.async_show_form(
+            step_id="init",
+            data_schema=_options_schema(current_offset),
+        )
